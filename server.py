@@ -3,9 +3,15 @@
 # ==== #
 
 import os
+import json
+import requests
 
 from hashlib import md5
 from base64 import b64encode, b64decode
+
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hashes, hmac, serialization
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidKey
@@ -27,21 +33,19 @@ app.config.update(
     SQLALCHEMY_TRACK_MODIFICATIONS = False,
     FLASK_APP = 'server',
 )
+
 db = SQLAlchemy(app)
 debug = True
 
-SALT_SIZE = 16 # Ideally, this should be in .env
+SALT_SIZE = 16
 SESSION_ID_SIZE = 16
+KEY_SIZE = 16
 
 # ===== #
 # Model #
 # ===== #
 
 class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(140), unique=True, nullable=False)
-    email = db.Column(db.String(140), unique=True, nullable=False)
-    password = db.Column(db.String(140), nullable=False)
     id       = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String, unique=True, nullable=False)
     email    = db.Column(db.String, unique=True, nullable=False)
@@ -54,9 +58,139 @@ class Session(db.Model):
 
 with app.app_context():
     db.create_all()
+
+# ============ #
+# Cryptography #
+# ============ #
+
+class HMAC:
+    def __init__(self, mac=None):
+        self.mac = os.urandom(KEY_SIZE) if mac is None else mac
+        self.hmac = hmac.HMAC(self.mac, hashes.SHA256())
+
+    def execute(self, message, finalize=True):
+        self.hmac.update(message)
+        if finalize:
+            return self.hmac.finalize()
+
+    def verify(self, signature):
+        self.hmac.verify(signature)
+
+class AES:
+    def __init__(self, key, iv):
+        self.key = os.urandom(KEY_SIZE) if key is None else key
+        self.iv = os.urandom(KEY_SIZE) if iv is None else iv
+
+        cipher = Cipher(
+            algorithms.AES(self.key),
+            modes.CTR(self.iv),
+            backend=default_backend()
+        )
+
+        self.encryptor = cipher.encryptor()
+        self.decryptor = cipher.decryptor()
+
+    def encrypt(self, message):
+        return self.encryptor.update(message) + self.encryptor.finalize()
+
+    def decrypt(self, message):
+        return self.decryptor.update(message) + self.decryptor.finalize()
+
+class KeySerializer:
+    def __init__(self, public_key_path, private_key_path=None):
+        self.public_key_path = public_key_path
+        self.private_key_path = private_key_path
+
+    def _read_public(self):
+        with open(self.public_key_path, "rb") as public_key_file_object:
+            public_key = serialization.load_pem_public_key(
+                public_key_file_object.read(),
+                backend=default_backend()
+            )
+        return public_key
+
+    def _read_private(self):
+        with open(self.private_key_path, "rb") as private_key_file_object:
+            private_key = serialization.load_pem_private_key(
+                private_key_file_object.read(),
+                backend=default_backend(),
+                password=None
+            )
+        return private_key
+
+    def read(self, which):
+        readers = {
+            'public' : self._read_public,
+            'private' : self._read_private,
+        }
+        return readers[which]()
+
+class Transmission:
+    def __init__(
+            self,
+            server_public_key,
+            server_private_key=None,
+            aes_key=None,
+            mac=None,
+            iv=None,
+        ):
+        self.server_public_key = server_public_key
+        self.server_private_key = server_private_key
+
+        self.aes = AES(key=aes_key, iv=iv)
+        self.sym_hmac = HMAC(
+            mac=self.server_public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        )
+        self.assym_hmac = HMAC(mac=mac)
+
+    def send(self, message_bytes):
+        sym_keys = self.aes.key + self.aes.iv + self.assym_hmac.mac
+
+        session_keys = self.server_public_key.encrypt(
+            sym_keys,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        cyphertext = self.aes.encrypt(message_bytes)
+        signature = self.assym_hmac.execute(session_keys + cyphertext)
+
+        payload = {
+            'session_keys': bytearr_to_b64(session_keys),
+            'cyphertext'  : bytearr_to_b64(cyphertext),
+            'hmac'        : bytearr_to_b64(signature),
+        }
+
+        print('\nConteúdo da requisição:')
+        print(payload)
+
+        return requests.post(
+            'http://localhost:5000/signin',
+            headers={ 'Content-Type': 'application/octet-stream' },
+            data=json.dumps(payload).encode('utf-8')
+        )
+
+    def verify(self, received_bytes):
+        session_keys = received_bytes['session_keys']
+        cyphertext = received_bytes['cyphertext']
+        signature = received_bytes['hmac']
+
+        self.assym_hmac.execute(session_keys + cyphertext, finalize=False)
+        self.assym_hmac.verify(signature)
+        return
+
+    def receive(self, cyphertext):
+        return json.loads(self.aes.decrypt(cyphertext).decode('utf-8'))
+
 # ===== #
 # Utils #
 # ===== #
+
 def get_header(title):
     return (
         f"""
@@ -72,10 +206,7 @@ def get_header(title):
     )
 
 def get_user_from_cookies():
-    return User.query.filter_by(id=request.cookies.get('user_id')).first()
     curr_session_id = request.cookies.get('session_id')
-
-    print(curr_session_id)
 
     if curr_session_id:
         curr_session = Session.query.filter_by(id=curr_session_id).first()
@@ -90,10 +221,10 @@ def get_user_from_cookies():
     return
 
 def bytearr_to_b64(bytearr):
-    return b64encode(bytearr).decode('ascii')
+    return b64encode(bytearr).decode('utf-8')
 
 def b64_to_bytearr(b64):
-    return b64decode(b64.encode('ascii'))
+    return b64decode(b64.encode('utf-8'))
 
 def is_correct_password(kdf, password_bytes, digest):
     try:
@@ -115,11 +246,13 @@ def create_session(user_id):
 
     res = make_response(redirect('/profile'), 302)
     res.set_cookie('session_id', session_id)
+
+    print('\nUsuário logado:')
+    print('ID da sessão:', session_id, end='\n\n')
     return res
 
 def init_kdf(salt=None):
     if salt is None: salt = os.urandom(SALT_SIZE)
-
     return (
         Scrypt(
             salt=salt, # Secret
@@ -131,9 +264,26 @@ def init_kdf(salt=None):
         ), salt
     )
 
+def decrypt_session_keys(cipher_keys, server_private_key):
+    session_keys = server_private_key.decrypt(
+        cipher_keys,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+
+    aes_key = session_keys[: KEY_SIZE]
+    aes_iv = session_keys[KEY_SIZE : 2*KEY_SIZE]
+    assym_mac = session_keys[2*KEY_SIZE :]
+    return aes_key, aes_iv, assym_mac
+
+
 # =========== #
 # Controllers #
 # =========== #
+
 def get_homepage():
     return make_response(
         get_header('EP4 | Redes') +
@@ -148,6 +298,7 @@ def get_homepage():
         </body>
         """, 200
     )
+
 def get_signup():
     return make_response(
         get_header('EP4 | Sign Up') +
@@ -169,10 +320,12 @@ def get_signup():
         </body>
         """, 200
     )
+
 def post_signup():
     for field in request.form.keys():
         if not request.form[field]:
             return make_response(f'<b>{field.title()}</b> is required!', 400)
+
     same_username_user = User.query.filter_by(username=request.form['username']).first()
     same_email_user = User.query.filter_by(email=request.form['email']).first()
     if same_username_user or same_email_user:
@@ -181,16 +334,17 @@ def post_signup():
     kdf, salt = init_kdf()
     digest = kdf.derive(request.form['password'].encode('utf-8'))
 
-    print('types', type(digest), type(salt))
-
     db.session.add(User(
         username=request.form['username'],
         email=request.form['email'],
-        password=request.form['password']
         password=bytearr_to_b64(salt + digest)
     ))
     db.session.commit()
 
+    print('\nUsuário cadastrado:')
+    print('i)   Senha original:', request.form['password'])
+    print('ii)  Sal:', salt.hex(), '| Digest:', digest.hex())
+    print('iii) Salvo no banco:', bytearr_to_b64(salt + digest), end='\n\n')
     return make_response('User created!', 201)
 
 def get_signin():
@@ -212,34 +366,57 @@ def get_signin():
         </body>
         """, 200
     )
+
 def post_signin():
-    for field in request.form.keys():
-        if not request.form[field]:
+    data = json.loads(request.data.decode('utf-8'))
+    for key, val in data.items():
+        data[key] = b64_to_bytearr(val)
+
+    key_serializer = KeySerializer(
+        public_key_path='./keys/rsa.public.pem',
+        private_key_path='./keys/rsa.private.pem',
+    )
+    server_public_key = key_serializer.read('public')
+    server_private_key = key_serializer.read('private')
+
+    aes_key, aes_iv, assym_mac = decrypt_session_keys(
+        data['session_keys'],
+        server_private_key
+    )
+
+    transmission = Transmission(
+        server_public_key=server_public_key,
+        server_private_key=server_private_key,
+        aes_key=aes_key,
+        iv=aes_iv,
+        mac=assym_mac
+    )
+    transmission.verify(data)
+    credentials = transmission.receive(data['cyphertext'])
+
+    for field in credentials.keys():
+        if not credentials[field]:
             return make_response(f'<b>{field.title()}</b> is required!', 400)
 
     registered_user = User.query.filter_by(
-        email=request.form['email'],
-        password=request.form['password']
+        email=credentials['email'],
     ).first()
 
     if registered_user:
-        res = make_response(redirect('/profile'), 302)
-        res.set_cookie('user_id', str(registered_user.id))
-        return res
         stored_hash_bytes = b64_to_bytearr(registered_user.password)
         stored_salt = stored_hash_bytes[:SALT_SIZE]
         stored_digest = stored_hash_bytes[SALT_SIZE:]
-        sent_password_bytes = request.form['password'].encode('utf-8')
+        sent_password_bytes = credentials['password'].encode('utf-8')
 
         kdf, _ = init_kdf(stored_salt)
 
         if is_correct_password(kdf, sent_password_bytes, stored_digest):
             return create_session(str(registered_user.id))
-
     return make_response('User not found!', 401)
 
 def get_profile():
     logged_user = get_user_from_cookies()
+
     if logged_user:
         return make_response(
             get_header('EP4 | Profile') +
@@ -255,8 +432,10 @@ def get_profile():
             """, 200
         )
     return abort(401, description="User not logged in!")
+
 def get_logout():
     logged_user = get_user_from_cookies()
+
     if logged_user:
         return make_response(
             get_header('EP4 | Logout') +
@@ -273,6 +452,7 @@ def get_logout():
                         <input type="submit" href="/logout" value="Logout" />
                     </form>
                 </div>
+
             </body>
             """, 200
         )
@@ -280,35 +460,41 @@ def get_logout():
 
 def post_logout():
     res = make_response(redirect('/'), 302)
-    res.set_cookie('user_id', '', max_age=0)
     res.set_cookie('session_id', '', max_age=0)
     return res
 
 # ====== #
 # Routes #
 # ====== #
+
 @app.route('/')
 def get_landpage():
     return get_homepage()
+
 @app.route('/signup', methods =['GET', 'POST'])
 def handle_signup():
     if request.method == 'GET': return get_signup()
     if request.method == 'POST': return post_signup()
     return make_response(f"Can't {request.method} /signup", 405)
+
 @app.route('/signin', methods =['GET', 'POST'])
 def handle_signin():
     if request.method == 'GET': return get_signin()
     if request.method == 'POST': return post_signin()
     return make_response(f"Can't {request.method} /signin", 405)
+
 @app.route('/profile')
 def get_user():
     return get_profile()
+
 @app.route('/logout', methods =['GET', 'POST'])
 def handle_logout():
     if request.method == 'GET': return get_logout()
     if request.method == 'POST': return post_logout()
     return make_response(f"Can't {request.method} /logout", 405)
+
 # ===== #
 # Start #
 # ===== #
+
 app.run(debug=debug)
